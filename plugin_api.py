@@ -2,12 +2,20 @@
 hermes-profile-migrator — Hermes Agent Profile Export/Import Plugin
 ====================================================================
 
-Provides two tools:
+Provides tools for profile migration with auto-sync to private GitHub repo.
+
+FEATURES:
   - export_profile: archive a Hermes profile, optionally sanitizing secrets
   - import_profile: restore an archive, remapping paths to the current user
+  - setup_backup_repo: create a private GitHub repo for profile sync (auto-called on install)
+  - sync_profile: bidirectional sync — pull remote + push local, merge state
+  - restore_profile: pull from private repo and import locally
 
-Install: copy this folder into ~/.hermes/plugins/hermes-profile-migrator/
-Then restart Hermes or run `hermes plugins reload`.
+ON INSTALL (plugin loaded by Hermes):
+  1. Check GitHub auth via `gh auth status`
+  2. Check if private backup repo exists for this user
+  3. If exists → auto-sync bidirectional + merge Hermes state
+  4. If not → create private repo, save config, ready for manual sync
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -67,33 +76,23 @@ def _squash_home(path_str: str, old_home: str, new_home: str) -> str:
 # ---------------------------------------------------------------------------
 
 SENSITIVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    # OpenAI / Azure
     ("openai_api_key", re.compile(r'OPENAI_API_KEY\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
     ("azure_api_key", re.compile(r'AZURE_OPENAI_API_KEY\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
-    # Anthropic
     ("anthropic_api_key", re.compile(r'ANTHROPIC_API_KEY\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
-    # OpenRouter
     ("openrouter_api_key", re.compile(r'OPENROUTER_API_KEY\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
-    # FAL
     ("fal_api_key", re.compile(r'FAL_KEY\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
     ("fal_api_key_dash", re.compile(r'FAL_API_KEY\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
-    # HuggingFace
     ("hf_token", re.compile(r'HUGGING_FACE_HUB_TOKEN\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
     ("hf_token_alt", re.compile(r'HUGGINGFACE_TOKEN\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
-    # Google / Gemini
     ("google_api_key", re.compile(r'GOOGLE_API_KEY\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
     ("gemini_api_key", re.compile(r'GEMINI_API_KEY\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
-    # Stability
     ("stability_api_key", re.compile(r'STABILITY_API_KEY\s*=\s*["\'][^"\']+["\']', re.IGNORECASE)),
-    # Generic bearer / token lines
     ("bearer_token", re.compile(r'(?i)(bearer|token)\s*=\s*["\'][^"\']+["\']')),
-    # Generic secret / password assignments
     ("generic_secret", re.compile(r'(?i)(secret|password|passwd|pwd)\s*=\s*["\'][^"\']+["\']')),
 ]
 
 
 def _sanitize_line(line: str) -> tuple[str, bool]:
-    """Return (sanitized_line, was_modified)."""
     for _name, pattern in SENSITIVE_PATTERNS:
         if pattern.search(line):
             key = pattern.search(line).group(0).split("=")[0].strip()
@@ -102,7 +101,6 @@ def _sanitize_line(line: str) -> tuple[str, bool]:
 
 
 def _sanitize_env_file(path: Path) -> int:
-    """Read .env, redact secrets, write .env.example. Return count of redacted values."""
     if not path.is_file():
         return 0
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -119,16 +117,11 @@ def _sanitize_env_file(path: Path) -> int:
     if example_path.exists() and path.name.endswith(".example"):
         return 0
     example_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-    # Remove the real .env from the archive
     path.unlink(missing_ok=True)
     return count
 
 
 def _sanitize_yaml_file(path: Path) -> int:
-    """
-    Walk a YAML file and redact any string value that looks like a secret.
-    Returns the number of redacted entries.
-    """
     if not path.is_file():
         return 0
     try:
@@ -141,7 +134,7 @@ def _sanitize_yaml_file(path: Path) -> int:
     if data is None:
         return 0
 
-    count = [0]  # mutable counter in nested function
+    count = [0]
 
     def _walk(node: Any, key_path: str = "") -> Any:
         if isinstance(node, dict):
@@ -159,8 +152,7 @@ def _sanitize_yaml_file(path: Path) -> int:
         return node
 
     clean = _walk(data)
-    # Consistent naming: config.example.yaml (same style as .env.example)
-    out_path = path.parent / f"config.example.yaml"
+    out_path = path.parent / "config.example.yaml"
     out_path.write_text(
         yaml.safe_dump(clean, default_flow_style=False, sort_keys=False),
         encoding="utf-8",
@@ -170,39 +162,28 @@ def _sanitize_yaml_file(path: Path) -> int:
 
 
 def _sanitize_profile(profile_path: Path) -> int:
-    """
-    Sanitize a profile directory in-place:
-      - .env          → .env.example  (redact secrets)
-      - config.yaml   → config.example.yaml (redact secrets)
-      - auth.json     → removed entirely
-      - any .env.*    → .env.*.example
-    Returns total number of redacted values.
-    """
     total = 0
 
-    # .env files (only top-level .env and .env.* — example files already handled)
     for env_file in profile_path.glob(".env"):
         total += _sanitize_env_file(env_file)
     for env_file in profile_path.glob(".env.*"):
         if env_file.name != ".env.example":
             total += _sanitize_env_file(env_file)
 
-    # config.yaml → config.example.yaml
     cfg = profile_path / "config.yaml"
     total += _sanitize_yaml_file(cfg)
 
-    # auth.json — remove entirely
     auth = profile_path / "auth.json"
     if auth.is_file():
         auth.unlink()
-        total += 1  # count the whole file as one sensitive artifact
+        total += 1
 
-    # Any nested .env files (skip those already processed above)
     for env_file in profile_path.rglob(".env"):
         if env_file.name not in (".env", ".env.example"):
             total += _sanitize_env_file(env_file)
 
     return total
+
 
 # ---------------------------------------------------------------------------
 # Archive I/O
@@ -240,6 +221,296 @@ def _extract_archive(archive: Path, dest: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GitHub helper functions
+# ---------------------------------------------------------------------------
+
+def _gh_api(endpoint: str, method: str = "GET", data: dict | None = None) -> dict:
+    cmd = ["gh", "api", endpoint, "-X", method]
+    if data is not None:
+        import json as _json
+        payload = _json.dumps(data)
+        cmd.extend(["-f", f"data={payload}"])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"gh api failed: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def _gh_cli(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["gh"] + args, capture_output=True, text=True)
+
+
+def _ensure_gh_auth() -> dict:
+    result = _gh_cli(["auth", "status"])
+    if result.returncode != 0:
+        raise RuntimeError(
+            "GitHub CLI not authenticated. Run `gh auth login` first, "
+            "or ensure Hermes has valid GitHub OAuth."
+        )
+    user = _gh_api("/user")
+    return user
+
+
+def _repo_exists(owner: str, repo: str) -> bool:
+    try:
+        _gh_api(f"/repos/{owner}/{repo}")
+        return True
+    except Exception:
+        return False
+
+
+def _get_repo_info(owner: str, repo: str) -> dict:
+    return _gh_api(f"/repos/{owner}/{repo}")
+
+
+def _create_private_repo(name: str, description: str, add_readme: bool = True) -> dict:
+    result = _gh_cli([
+        "repo", "create", name,
+        "--private",
+        "--description", description,
+    ])
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create repo: {result.stderr.strip()}")
+    user = _ensure_gh_auth()
+    return _get_repo_info(user["login"], name)
+
+
+def _get_latest_archive_from_repo(owner: str, repo: str, ref: str = "main") -> Path | None:
+    import tempfile as _tempfile
+
+    try:
+        contents = _gh_api(f"/repos/{owner}/{repo}/contents/", params={"ref": ref})
+    except Exception:
+        return None
+
+    archives = []
+    for item in contents:
+        name = item.get("name", "")
+        if name.endswith(".zip") or name.endswith(".tar.gz") or name.endswith(".tgz"):
+            archives.append(item)
+
+    if not archives:
+        for item in contents:
+            if item.get("type") == "dir":
+                try:
+                    sub = _gh_api(f"/repos/{owner}/{repo}/contents/{item['name']}", params={"ref": ref})
+                    for s in sub:
+                        name = s.get("name", "")
+                        if name.endswith(".zip") or name.endswith(".tar.gz") or name.endswith(".tgz"):
+                            archives.append(s)
+                except Exception:
+                    pass
+
+    if not archives:
+        return None
+
+    latest = sorted(archives, key=lambda x: x.get("download_url", ""), reverse=True)[0]
+    temp_dir = _tempfile.mkdtemp()
+    dest_path = Path(temp_dir) / latest["name"]
+    download_url = latest["download_url"]
+
+    token_result = _gh_cli(["auth", "token"])
+    token = token_result.stdout.strip()
+
+    import urllib.request
+    req = urllib.request.Request(download_url)
+    req.add_header("Authorization", f"token {token}")
+    with urllib.request.urlopen(req) as resp:
+        dest_path.write_bytes(resp.read())
+
+    return dest_path
+
+
+def _push_archive_to_repo(owner: str, repo: str, archive_path: Path, commit_msg: str, branch: str = "main") -> str:
+    import tempfile as _tempfile
+
+    temp_dir = _tempfile.mkdtemp()
+    repo_dir = Path(temp_dir) / "repo"
+    subprocess.run(
+        ["git", "clone", f"git@github.com:{owner}/{repo}.git", str(repo_dir)],
+        check=True, capture_output=True,
+    )
+
+    arc_name = archive_path.name
+    dest_file = repo_dir / arc_name
+    shutil.copy2(archive_path, dest_file)
+
+    subprocess.run(["git", "add", arc_name], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", commit_msg],
+        cwd=repo_dir, check=True, capture_output=True,
+    )
+    subprocess.run(["git", "push", "origin", branch], cwd=repo_dir, check=True, capture_output=True)
+
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_dir, capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+def _pull_repo(owner: str, repo: str, dest: Path) -> Path:
+    if dest.exists():
+        subprocess.run(["git", "-C", str(dest), "pull"], check=True, capture_output=True)
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "clone", f"git@github.com:{owner}/{repo}.git", str(dest)],
+            check=True, capture_output=True,
+        )
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# Hermes State Merge Logic
+# ---------------------------------------------------------------------------
+
+def _get_hermes_state_path() -> Path:
+    return _get_hermes_home() / "state.db"
+
+
+def _merge_state_databases(local_path: Path, remote_profile_path: Path) -> dict:
+    import sqlite3
+
+    if not local_path.is_file():
+        return {"sessions_merged": 0, "sessions_conflicted": 0, "message": "No local state.db found."}
+
+    if not remote_profile_path.is_file():
+        return {"sessions_merged": 0, "sessions_conflicted": 0, "message": "No remote state.db found in profile."}
+
+    local_stat = local_path.stat()
+    remote_stat = remote_profile_path.stat()
+
+    if remote_stat.st_mtime > local_stat.st_mtime:
+        backup = local_path.with_suffix(".db.backup")
+        if not backup.exists():
+            shutil.copy2(local_path, backup)
+        shutil.copy2(remote_profile_path, local_path)
+        return {
+            "sessions_merged": 1,
+            "sessions_conflicted": 0,
+            "strategy": "replace_newer",
+            "message": f"Replaced local state.db with remote (remote newer). Local backup at {backup}."
+        }
+    else:
+        return {
+            "sessions_merged": 0,
+            "sessions_conflicted": 0,
+            "strategy": "keep_local",
+            "message": "Local state.db is newer or same age — kept local version."
+        }
+
+
+def _merge_hermes_memory(local_home: Path, remote_profile_path: Path) -> dict:
+    memories_dir = local_home / "memories"
+    remote_memories = remote_profile_path / "memories"
+
+    stats = {"files_copied": 0, "files_skipped": 0, "message": ""}
+
+    if not remote_memories.is_dir():
+        stats["message"] = "No remote memories directory found."
+        return stats
+
+    if not memories_dir.exists():
+        memories_dir.mkdir(parents=True, exist_ok=True)
+
+    for mem_file in remote_memories.iterdir():
+        if mem_file.is_file():
+            local_file = memories_dir / mem_file.name
+            if not local_file.exists():
+                shutil.copy2(mem_file, local_file)
+                stats["files_copied"] += 1
+            else:
+                if mem_file.read_bytes() != local_file.read_bytes():
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                    backup_name = f"{mem_file.stem}_{ts}{mem_file.suffix}"
+                    shutil.copy2(local_file, memories_dir / backup_name)
+                    shutil.copy2(mem_file, local_file)
+                    stats["files_copied"] += 1
+                else:
+                    stats["files_skipped"] += 1
+
+    stats["message"] = f"Merged memories: {stats['files_copied']} copied, {stats['files_skipped']} skipped."
+    return stats
+
+
+def _merge_hermes_sessions(local_home: Path, remote_profile_path: Path) -> dict:
+    sessions_dir = local_home / "sessions"
+    remote_sessions = remote_profile_path / "sessions"
+
+    stats = {"files_copied": 0, "files_skipped": 0, "message": ""}
+
+    if not remote_sessions.is_dir():
+        stats["message"] = "No remote sessions directory found."
+        return stats
+
+    if not sessions_dir.exists():
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    for sess_file in remote_sessions.iterdir():
+        if sess_file.is_file():
+            local_file = sessions_dir / sess_file.name
+            if not local_file.exists():
+                shutil.copy2(sess_file, local_file)
+                stats["files_copied"] += 1
+            else:
+                stats["files_skipped"] += 1
+
+    stats["message"] = f"Merged sessions: {stats['files_copied']} copied, {stats['files_skipped']} skipped."
+    return stats
+
+
+def _merge_hermes_skills(local_home: Path, remote_profile_path: Path) -> dict:
+    skills_dir = local_home / "skills"
+    remote_skills = remote_profile_path / "skills"
+
+    stats = {"files_copied": 0, "dirs_copied": 0, "message": ""}
+
+    if not remote_skills.is_dir():
+        stats["message"] = "No remote skills directory found."
+        return stats
+
+    if not skills_dir.exists():
+        skills_dir.mkdir(parents=True, exist_ok=True)
+
+    for item in remote_skills.iterdir():
+        local_item = skills_dir / item.name
+        if not local_item.exists():
+            if item.is_dir():
+                shutil.copytree(item, local_item)
+                stats["dirs_copied"] += 1
+            else:
+                shutil.copy2(item, local_item)
+                stats["files_copied"] += 1
+
+    stats["message"] = f"Merged skills: {stats['files_copied']} files, {stats['dirs_copied']} dirs copied."
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Config management (local plugin config)
+# ---------------------------------------------------------------------------
+
+def _get_plugin_config() -> dict:
+    plugin_dir = Path(__file__).parent
+    config_path = plugin_dir / "config.json"
+    if config_path.is_file():
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _save_plugin_config(config: dict) -> None:
+    plugin_dir = Path(__file__).parent
+    config_path = plugin_dir / "config.json"
+    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _detect_github_username() -> str:
+    user = _ensure_gh_auth()
+    return user["login"]
+
+
+# ---------------------------------------------------------------------------
 # Public tool implementations
 # ---------------------------------------------------------------------------
 
@@ -249,18 +520,6 @@ def export_profile(
     mode: str = "sanitized",
     format: str = "zip",
 ) -> Dict[str, Any]:
-    """
-    Export a Hermes profile to a compressed archive.
-
-    Args:
-        profile_name:  Profile directory name under ~/.hermes/profiles/.
-        output_path:   Where to write the archive. Defaults to Desktop.
-        mode:          "sanitized" (strip secrets) or "full" (keep everything).
-        format:        "zip" or "tar.gz".
-
-    Returns:
-        Dict with success, archive_path, mode, files_sanitized, message.
-    """
     profile_path = _profile_dir(profile_name)
     if not profile_path.is_dir():
         return {
@@ -268,7 +527,6 @@ def export_profile(
             "message": f"Profile not found: {profile_path}",
         }
 
-    # Determine output location
     if not output_path:
         desktop = Path.home() / "Desktop"
         output_path = str(desktop / f"hermes-profile-{profile_name}")
@@ -278,10 +536,8 @@ def export_profile(
     else:
         archive_path = out.with_suffix(f".{format.replace('tar.gz', 'tar.gz')}")
 
-    # Work on a temporary copy so we don't mutate the live profile
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        # copy profile dir into tmp
         copy_dest = tmp_path / profile_path.name
         shutil.copytree(profile_path, copy_dest)
 
@@ -296,7 +552,6 @@ def export_profile(
         else:
             return {"success": False, "message": f"Unknown mode: {mode}"}
 
-        # Build archive
         _ensure_parent(archive_path)
         if format == "zip":
             _archive_zip(copy_dest.parent, archive_path)
@@ -322,18 +577,6 @@ def import_profile(
     overwrite: bool = False,
     preserve_relative_paths: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Import a Hermes profile archive into the current machine.
-
-    Args:
-        archive_path:             Path to the .zip / .tar.gz archive.
-        target_profile:           Desired profile name. Defaults to archive's original name.
-        overwrite:                Overwrite existing profile if True.
-        preserve_relative_paths:  Only rewrite absolute paths under the old home dir.
-
-    Returns:
-        Dict with success, profile_name, profile_path, paths_updated, message.
-    """
     if not archive_path:
         return {"success": False, "message": "archive_path is required."}
 
@@ -341,21 +584,15 @@ def import_profile(
     if not src.is_file():
         return {"success": False, "message": f"Archive not found: {src}"}
 
-    # Extract to temp
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         _extract_archive(src, tmp_path)
 
-        # Find the profile directory inside the archive
-        # The archive was created from ~/.hermes/profiles/<name>/
-        # so the top-level should contain a directory named <name>
         candidates = [d for d in tmp_path.iterdir() if d.is_dir()]
         if not candidates:
-            # Maybe the archive root IS the profile dir
             candidates = [tmp_path]
         profile_dir = candidates[0]
 
-        # Determine profile name
         detected_name = profile_dir.name
         if target_profile:
             profile_name = target_profile
@@ -377,44 +614,33 @@ def import_profile(
                     ),
                 }
 
-        # Detect old home from config files and remap paths
         old_home = None
         paths_updated = 0
 
-        # Try to detect old username from .env.example or config.example.yaml
-        for marker in ("config.example.yaml", "config.yaml.example", "config.yaml"):
+        for marker in ("config.example.yaml", "config.yaml.example", "config.yaml", ".env.example", ".env"):
             mf = profile_dir / marker
             if mf.is_file():
                 try:
                     text = mf.read_text(encoding="utf-8", errors="replace")
-                    # Look for a path like C:\Users\OLDNAME or /home/OLDNAME
-                    m = re.search(r'(?:C:\\Users\\|/\w+/)(\w+)', text)
+                    m = re.search(r'(?:C:\\Users\\|/)(\w+)', text)
                     if m:
-                        old_home = str(Path.home() / m.group(1))  # approximate
+                        old_home = str(Path.home() / m.group(1))
                         break
                 except Exception:
                     pass
 
         if old_home is None:
-            # Fallback: assume old home was C:\Users\<something> or /home/<something>
-            # We'll remap based on current username
-            old_home = str(Path.home())  # safest: treat as same-home move
+            old_home = str(Path.home())
 
         new_home = str(Path.home())
 
-        # Remap paths in config files
         for cfg_file in profile_dir.rglob("config*.yaml"):
             if cfg_file.suffix == ".yaml":
                 try:
                     text = cfg_file.read_text(encoding="utf-8", errors="replace")
                     new_text = text
                     if old_home != new_home:
-                        # Replace old home path with new home in string values
-                        new_text = re.sub(
-                            re.escape(old_home),
-                            new_home,
-                            text,
-                        )
+                        new_text = re.sub(re.escape(old_home), new_home, text)
                     if new_text != text:
                         paths_updated += 1
                     cfg_file.write_text(new_text, encoding="utf-8")
@@ -448,7 +674,6 @@ def import_profile(
             except Exception:
                 pass
 
-        # Copy into final location
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(profile_dir, dest)
 
@@ -464,12 +689,333 @@ def import_profile(
     }
 
 
+def setup_backup_repo(
+    repo_name: str = "hermes-profile-backup",
+    profile_name: str = "default",
+    add_readme: bool = True,
+) -> Dict[str, Any]:
+    try:
+        user = _ensure_gh_auth()
+        github_user = user["login"]
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"GitHub auth check failed: {str(e)}. Run `gh auth login` first.",
+        }
+
+    if _repo_exists(github_user, repo_name):
+        repo_info = _get_repo_info(github_user, repo_name)
+        if repo_info.get("visibility") != "private":
+            return {
+                "success": False,
+                "message": (
+                    f"Repo {github_user}/{repo_name} exists but is NOT private "
+                    f"(visibility: {repo_info.get('visibility')}). "
+                    f"Convert to private with: gh repo edit {repo_name} --visibility private"
+                ),
+            }
+        config = _get_plugin_config()
+        config["backup_repo"] = f"{github_user}/{repo_name}"
+        config["github_user"] = github_user
+        config["profile_name"] = profile_name
+        config["repo_name"] = repo_name
+        _save_plugin_config(config)
+
+        return {
+            "success": True,
+            "repo_url": repo_info.get("html_url"),
+            "repo_name": repo_name,
+            "profile_name": profile_name,
+            "message": (
+                f"Private backup repo already exists: {repo_info.get('html_url')}. "
+                f"Config saved. Ready for sync_profile / restore_profile."
+            ),
+        }
+
+    try:
+        repo_info = _create_private_repo(
+            name=repo_name,
+            description=f"Hermes profile backup for '{profile_name}' — PRIVATE. Do not make public.",
+            add_readme=add_readme,
+        )
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to create private repo: {str(e)}",
+        }
+
+    config = _get_plugin_config()
+    config["backup_repo"] = f"{github_user}/{repo_name}"
+    config["github_user"] = github_user
+    config["profile_name"] = profile_name
+    config["repo_name"] = repo_name
+    config["repo_created_at"] = datetime.now(timezone.utc).isoformat()
+    _save_plugin_config(config)
+
+    return {
+        "success": True,
+        "repo_url": repo_info.get("html_url"),
+        "repo_name": repo_name,
+        "profile_name": profile_name,
+        "message": (
+            f"Private backup repo created: {repo_info.get('html_url')}. "
+            f"Config saved locally. Use sync_profile to push your profile, "
+            f"or restore_profile to pull from this repo."
+        ),
+    }
+
+
+def sync_profile(
+    profile_name: str = "",
+    mode: str = "sanitized",
+    message: str = "",
+) -> Dict[str, Any]:
+    config = _get_plugin_config()
+    if not config.get("backup_repo"):
+        return {
+            "success": False,
+            "message": "No backup repo configured. Run setup_backup_repo first.",
+        }
+
+    repo_slug = config["backup_repo"]
+    github_user = config.get("github_user", _detect_github_username())
+    target_profile = profile_name or config.get("profile_name", "default")
+
+    if "/" in repo_slug:
+        owner, repo = repo_slug.split("/", 1)
+    else:
+        owner = github_user
+        repo = repo_slug
+
+    try:
+        repo_info = _get_repo_info(owner, repo)
+        if repo_info.get("visibility") != "private":
+            return {
+                "success": False,
+                "message": (
+                    f"SECURITY: Repo {owner}/{repo} is now PUBLIC. "
+                    f"Convert back to private: gh repo edit {repo} --visibility private"
+                ),
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Cannot access repo {owner}/{repo}: {str(e)}",
+        }
+
+    remote_archive = _get_latest_archive_from_repo(owner, repo)
+    remote_imported = False
+    merge_stats = {}
+
+    if remote_archive is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            _extract_archive(remote_archive, tmp_path)
+            candidates = [d for d in tmp_path.iterdir() if d.is_dir()]
+            if candidates:
+                remote_profile_dir = candidates[0]
+                temp_profile_name = f"_sync_temp_{target_profile}"
+                temp_dest = _get_hermes_home() / "profiles" / temp_profile_name
+                if temp_dest.exists():
+                    shutil.rmtree(temp_dest)
+                shutil.copytree(remote_profile_dir, temp_dest)
+
+                local_state = _get_hermes_state_path()
+                remote_state = temp_dest / "state.db"
+                if remote_state.is_file() and local_state.is_file():
+                    merge_stats = _merge_state_databases(local_state, remote_state)
+
+                hermes_home = _get_hermes_home()
+                merge_stats_mem = _merge_hermes_memory(hermes_home, temp_dest)
+                merge_stats_sessions = _merge_hermes_sessions(hermes_home, temp_dest)
+                merge_stats_skills = _merge_hermes_skills(hermes_home, temp_dest)
+
+                shutil.rmtree(temp_dest)
+                remote_imported = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        archive_name = f"hermes-profile-{target_profile}-{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
+        archive_path = tmp_path / archive_name
+
+        export_result = export_profile(
+            profile_name=target_profile,
+            output_path=str(archive_path),
+            mode=mode,
+            format="zip",
+        )
+
+        if not export_result["success"]:
+            return export_result
+
+        commit_msg = message or f"Sync profile '{target_profile}' at {datetime.now(timezone.utc).isoformat()}"
+        try:
+            commit_sha = _push_archive_to_repo(github_user, repo, Path(export_result["archive_path"]), commit_msg)
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Failed to push to repo: {str(e)}",
+            }
+
+    return {
+        "success": True,
+        "repo_url": f"https://github.com/{owner}/{repo}",
+        "commit": commit_sha,
+        "profile_name": target_profile,
+        "remote_synced": remote_imported,
+        "merge_stats": merge_stats,
+        "message": (
+            f"Profile '{target_profile}' synced to {owner}/{repo}. "
+            f"Commit: {commit_sha}. "
+            + (f"Remote changes merged: {merge_stats.get('message', 'none')}. " if merge_stats else "")
+            + (f"Push mode: {mode}. " if mode else "")
+        ),
+    }
+
+
+def restore_profile(
+    profile_name: str = "",
+    version: str = "",
+) -> Dict[str, Any]:
+    config = _get_plugin_config()
+    if not config.get("backup_repo"):
+        return {
+            "success": False,
+            "message": "No backup repo configured. Run setup_backup_repo first.",
+        }
+
+    repo_slug = config["backup_repo"]
+    github_user = config.get("github_user", _detect_github_username())
+    target_profile = profile_name or config.get("profile_name", "default")
+
+    if "/" in repo_slug:
+        owner, repo = repo_slug.split("/", 1)
+    else:
+        owner = github_user
+        repo = repo_slug
+
+    try:
+        repo_info = _get_repo_info(owner, repo)
+        if repo_info.get("visibility") != "private":
+            return {
+                "success": False,
+                "message": (
+                    f"SECURITY: Repo {owner}/{repo} is PUBLIC. "
+                    f"Convert to private: gh repo edit {repo} --visibility private"
+                ),
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Cannot access repo {owner}/{repo}: {str(e)}",
+        }
+
+    ref = version or "main"
+    archive_path = _get_latest_archive_from_repo(owner, repo, ref=ref)
+    if archive_path is None:
+        return {
+            "success": False,
+            "message": f"No profile archive found in {owner}/{repo} (ref: {ref}).",
+        }
+
+    import_result = import_profile(
+        archive_path=str(archive_path),
+        target_profile=target_profile,
+        overwrite=True,
+    )
+
+    if not import_result["success"]:
+        return import_result
+
+    return {
+        "success": True,
+        "profile_name": target_profile,
+        "profile_path": import_result["profile_path"],
+        "message": (
+            f"Profile '{target_profile}' restored from {owner}/{repo} "
+            f"(ref: {ref}) to {import_result['profile_path']}."
+        ),
+    }
+
+
+def auto_sync_on_load() -> Dict[str, Any]:
+    result_parts = []
+
+    try:
+        user = _ensure_gh_auth()
+        github_user = user["login"]
+        result_parts.append(f"✓ GitHub auth OK (user: {github_user})")
+    except Exception as e:
+        result_parts.append(f"✗ GitHub auth failed: {str(e)}. Run `gh auth login`.")
+        return {
+            "success": False,
+            "message": " | ".join(result_parts),
+            "action_needed": "Run `gh auth login` to authenticate with GitHub.",
+        }
+
+    config = _get_plugin_config()
+    repo_name = config.get("repo_name", "hermes-profile-backup")
+    profile_name = config.get("profile_name", "default")
+
+    if _repo_exists(github_user, repo_name):
+        repo_info = _get_repo_info(github_user, repo_name)
+        if repo_info.get("visibility") != "private":
+            result_parts.append(
+                f"⚠ Repo {github_user}/{repo_name} is PUBLIC — security risk. "
+                f"Convert to private: gh repo edit {repo_name} --visibility private"
+            )
+            return {
+                "success": False,
+                "message": " | ".join(result_parts),
+                "action_needed": "Convert repo to private immediately.",
+            }
+        result_parts.append(f"✓ Private backup repo found: {repo_info.get('html_url')}")
+
+        try:
+            sync_result = sync_profile(profile_name=profile_name, mode="sanitized")
+            if sync_result["success"]:
+                result_parts.append(f"✓ Sync complete: {sync_result.get('message', '')}")
+            else:
+                result_parts.append(f"⚠ Sync had issues: {sync_result.get('message', '')}")
+        except Exception as e:
+            result_parts.append(f"⚠ Sync failed: {str(e)}")
+
+        return {
+            "success": True,
+            "message": " | ".join(result_parts),
+            "repo_url": repo_info.get("html_url"),
+            "profile_name": profile_name,
+            "synced": True,
+        }
+    else:
+        result_parts.append(f"No backup repo found for {github_user}. Creating private repo...")
+
+        setup_result = setup_backup_repo(
+            repo_name=repo_name,
+            profile_name=profile_name,
+            add_readme=True,
+        )
+
+        if setup_result["success"]:
+            result_parts.append(f"✓ Private repo created: {setup_result.get('repo_url', '')}")
+            result_parts.append("  Run sync_profile to push your first profile archive.")
+        else:
+            result_parts.append(f"✗ Failed to create repo: {setup_result.get('message', '')}")
+
+        return {
+            "success": setup_result["success"],
+            "message": " | ".join(result_parts),
+            "repo_url": setup_result.get("repo_url"),
+            "profile_name": profile_name,
+            "repo_created": setup_result["success"],
+        }
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
 
 def get_tools() -> list[dict]:
-    """Return the tool definitions for Hermes plugin registry."""
     return [
         {
             "name": "export_profile",
@@ -533,17 +1079,97 @@ def get_tools() -> list[dict]:
                 "required": ["archive_path"],
             },
         },
+        {
+            "name": "setup_backup_repo",
+            "description": "Create a PRIVATE GitHub repository for automated profile backup and sync. This repo will store your sanitized profile archives. ALWAYS PRIVATE — never public, to protect your agent config from exposure.",
+            "parameter_schema": {
+                "type": "object",
+                "properties": {
+                    "repo_name": {
+                        "type": "string",
+                        "description": "Name for the backup repository. Defaults to 'hermes-profile-backup'.",
+                        "default": "hermes-profile-backup",
+                    },
+                    "profile_name": {
+                        "type": "string",
+                        "description": "The Hermes profile this repo will back up. Defaults to 'default'.",
+                        "default": "default",
+                    },
+                    "add_readme": {
+                        "type": "boolean",
+                        "description": "Whether to add a README.md to the new repository.",
+                        "default": True,
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "sync_profile",
+            "description": "Bidirectional sync: pull remote changes from private backup repo first, then push local profile. Merges Hermes state (state.db, memories, sessions, skills) when remote is newer. Requires setup_backup_repo to have been run first.",
+            "parameter_schema": {
+                "type": "object",
+                "properties": {
+                    "profile_name": {
+                        "type": "string",
+                        "description": "Profile to sync. Defaults to the one configured in setup_backup_repo.",
+                        "default": "",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["sanitized", "full"],
+                        "description": "Export mode for push. 'sanitized' (default) strips API keys; 'full' keeps everything.",
+                        "default": "sanitized",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Commit message. Defaults to auto-generated 'Sync profile <name> at <timestamp>'.",
+                        "default": "",
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "restore_profile",
+            "description": "Pull the latest profile archive from your private backup repository and import it into your local Hermes installation. Optionally specify a git ref (branch name, tag, or commit SHA) to restore from.",
+            "parameter_schema": {
+                "type": "object",
+                "properties": {
+                    "profile_name": {
+                        "type": "string",
+                        "description": "Profile to restore. Defaults to the one configured in setup_backup_repo.",
+                        "default": "",
+                    },
+                    "version": {
+                        "type": "string",
+                        "description": "Git ref to restore from (branch name, tag, or commit SHA). Defaults to 'main'.",
+                        "default": "",
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "auto_sync_on_load",
+            "description": "Internal: called automatically when plugin loads. Checks GitHub auth, detects existing private backup repo, performs bidirectional sync + state merge, or creates repo if missing. Returns status for logging.",
+            "parameter_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
     ]
 
 
 # ---------------------------------------------------------------------------
-# Standalone self-test (run `python plugin_api.py` directly)
+# Standalone CLI (run `python plugin_api.py <command>`)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Hermes Profile Migrator — standalone test")
+    parser = argparse.ArgumentParser(description="Hermes Profile Migrator — standalone CLI")
     sub = parser.add_subparsers(dest="command")
 
     p_exp = sub.add_parser("export")
@@ -556,6 +1182,22 @@ if __name__ == "__main__":
     p_imp.add_argument("archive", help="Path to archive")
     p_imp.add_argument("--profile", default="")
     p_imp.add_argument("--overwrite", action="store_true")
+
+    p_setup = sub.add_parser("setup")
+    p_setup.add_argument("--repo-name", default="hermes-profile-backup")
+    p_setup.add_argument("--profile", default="default")
+    p_setup.add_argument("--no-readme", action="store_true")
+
+    p_sync = sub.add_parser("sync")
+    p_sync.add_argument("--profile", default="")
+    p_sync.add_argument("--mode", choices=["sanitized", "full"], default="sanitized")
+    p_sync.add_argument("--message", default="")
+
+    p_restore = sub.add_parser("restore")
+    p_restore.add_argument("--profile", default="")
+    p_restore.add_argument("--version", default="")
+
+    p_auto = sub.add_parser("auto-check")
 
     args = parser.parse_args()
 
@@ -572,6 +1214,25 @@ if __name__ == "__main__":
             target_profile=args.profile,
             overwrite=args.overwrite,
         )
+    elif args.command == "setup":
+        result = setup_backup_repo(
+            repo_name=args.repo_name,
+            profile_name=args.profile,
+            add_readme=not args.no_readme,
+        )
+    elif args.command == "sync":
+        result = sync_profile(
+            profile_name=args.profile,
+            mode=args.mode,
+            message=args.message,
+        )
+    elif args.command == "restore":
+        result = restore_profile(
+            profile_name=args.profile,
+            version=args.version,
+        )
+    elif args.command == "auto-check":
+        result = auto_sync_on_load()
     else:
         parser.print_help()
         sys.exit(1)

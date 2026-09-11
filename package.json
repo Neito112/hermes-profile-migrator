@@ -1,15 +1,15 @@
 {
   "name": "hermes-profile-migrator",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "displayName": "Hermes Profile Migrator",
-  "description": "Export and import Hermes Agent profiles with automatic API key sanitization and path remapping. Share sanitized profiles safely with the community, or migrate full profiles between your own machines.",
+  "description": "Export, import, and bidirectional sync Hermes Agent profiles with automatic API key sanitization and path remapping. Auto-creates a private GitHub repo for each user — sync profile, memories, sessions, and skills across all your machines.",
   "author": "Hermes Community",
   "license": "MIT",
-  "keywords": ["hermes", "profile", "migration", "backup", "export", "import", "sanitize"],
+  "keywords": ["hermes", "profile", "migration", "backup", "export", "import", "sync", "sanitize", "github"],
   "hermes": {
     "type": "plugin",
     "api": "plugin_api.py",
-    "tools": ["export_profile", "import_profile"],
+    "tools": ["export_profile", "import_profile", "setup_backup_repo", "sync_profile", "restore_profile", "auto_sync_on_load"],
     "platforms": ["windows", "linux", "macos"]
   },
   "dependencies": {

@@ -2,8 +2,13 @@
 
 > Export and import Hermes Agent profiles with automatic API key sanitization and path remapping.
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](package.json)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](package.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![GitHub repo](https://img.shields.io/badge/repo-Neito112%2Fhermes--profile--migrator-24292e.svg)](https://github.com/Neito112/hermes-profile-migrator)
+
+> A Hermes Agent plugin for exporting and importing profiles — with automatic API key sanitization and cross-machine path remapping. **v1.1+ adds bidirectional sync to your own private GitHub repo** — install once, auto-sync profile + memories + sessions across machines.
+
+**Repository:** https://github.com/Neito112/hermes-profile-migrator
 
 ---
 
@@ -32,8 +37,10 @@
 - **Loại bỏ tự động** các API key nhạy cảm (OpenRouter, OpenAI, Anthropic, FAL, HuggingFace, v.v.) trước khi chia sẻ ra cộng đồng — chế độ **sanitized** (mặc định)
 - **Di chuyển toàn bộ profile** giữa các máy của riêng bạn — chế độ **full**
 - **Nhập (import)** profile đã xuất vào máy mới, tự động phát hiện username Windows và cập nhật lại tất cả đường dẫn trong config
+- **[v1.1] Tự động đồng bộ 2 chiều** với private GitHub repo riêng của bạn — cài 1 lần, mọi máy cùng chia sẻ 1 profile, bộ nhớ (memories), phiên trò chuyện (sessions) và skills được hợp nhất tự động
+- **[v1.1] Auto-check khi cài plugin** — Hermes sẽ tự check GitHub auth, tạo repo private nếu chưa có, hoặc sync bidirectional ngay nếu repo đã tồn tại
 
-> ⚠️ **Không có plugin tương tự** trong registry hiện tại — đây là tool độc lập đầu tiên cho Hermes profile migration.
+> ⚠️ **Không có plugin tương tự** trong registry hiện tại — đây là tool độc lập đầu tiên cho Hermes profile migration + sync.
 
 ---
 
@@ -46,8 +53,31 @@
 | **Tự động detect username Windows** | Khi import, plugin đọc đường dẫn cũ từ config, trích xuất username, và remap tất cả path sang machine mới. |
 | **Hỗ trợ cả Linux/macOS** | Path remapping hoạt động với `/home/username` và `C:\Users\username`. |
 | **Hai định dạng archive** | `.zip` (mặc định, cross-platform) và `.tar.gz` (nhỏ hơn, Linux/macOS friendly). |
-| **CLI standalone** | Chạy trực tiếp `python plugin_api.py export|import` mà không cần Hermes đang chạy. |
+| **CLI standalone** | Chạy trực tiếp `python plugin_api.py export|import|setup|sync|restore` mà không cần Hermes đang chạy. |
 | **Hermes plugin integration** | Đăng ký với Hermes plugin system, gọi qua `hermes tools` hoặc gateway API. |
+| **[v1.1] Private GitHub repo auto-create** | `setup_backup_repo` tự tạo private repo trên GitHub của bạn — không bao giờ public, bảo vệ config khỏi người khác xem. |
+| **[v1.1] Bidirectional sync** | `sync_profile` kéo dữ liệu remote về local (nếu remote mới hơn), sau đó đẩy profile local lên repo. Hợp nhất state.db, memories, sessions, skills tự động. |
+| **[v1.1] Auto-sync on plugin load** | `auto_sync_on_load()` chạy tự động khi Hermes load plugin — check auth, detect repo, sync hoặc tạo repo mới. |
+| **[v1.1] Private enforcement** | Plugin kiểm tra visibility của repo trước mỗi sync — nếu repo bị public, REFUSE sync và báo user convert về private ngay. |
+
+---
+
+## 🔄 Bidirectional Sync — Đặc quyền v1.1
+
+### Tại sao cần sync?
+
+Thay vì export/import thủ công từng lần, plugin v1.1 cho phép bạn có **1 profile duy nhất được đồng bộ giữa mọi máy** qua private GitHub repo:
+
+```
+Máy A (Đà Nẵng)          Máy B (Hà Nội)           Máy C (nước ngoài)
+     ↓                         ↓                         ↓
+  [profile]  ←─────────→  [profile]  ←─────────→  [profile]
+     ↓                         ↓                         ↓
+  private repo ◄────────── private repo ◄────────── private repo
+  (GitHub)                 (GitHub)                 (GitHub)
+```
+
+Mọi thay đổi trên máy này sẽ được đẩy lên repo, và các máy khác sẽ pull về khi sync.
 
 ---
 
@@ -149,6 +179,107 @@ import_profile(archive_path="/path/to/hermes-profile-default.zip", overwrite=fal
 ```
 
 Tool definitions are declared in `schema.json` — Hermes reads them at plugin load time.
+
+---
+
+## 🔄 Setup & Sync Workflow / Quy trình đồng bộ
+
+### Bước 1: Cài plugin (chỉ làm 1 lần)
+
+```bash
+# Copy vào Hermes plugins
+cp -r ~/Desktop/hermes-profile-migrator ~/.hermes/plugins/
+
+# Reload plugin
+hermes plugins reload
+```
+
+### Bước 2: Plugin tự động chạy khi Hermes khởi động
+
+Khi Hermes load plugin, `auto_sync_on_load()` tự động chạy:
+
+1. **Check GitHub auth** — nếu chưa auth, báo user chạy `gh auth login`
+2. **Check private repo** — nếu chưa có, tự tạo private repo `hermes-profile-backup` trên GitHub của user
+3. **Nếu repo đã có** — pull remote archive về, merge state (state.db, memories, sessions, skills), sau đó push local profile lên repo
+4. **Lưu config** vào `plugin_dir/config.json` để lần sau không phải setup lại
+
+Output ví dụ khi Hermes khởi động:
+
+```
+✓ GitHub auth OK (user: Neito112)
+✓ Private backup repo found: https://github.com/Neito112/hermes-profile-backup
+✓ Sync complete: Profile 'default' synced to Neito112/hermes-profile-backup.
+   Commit: a1b2c3d4e5f6. Remote changes merged: Merged memories: 2 copied, 0 skipped.
+```
+
+### Bước 3: Sync thủ công (khi muốn đồng bộ ngay)
+
+```bash
+# Sync profile (pull remote + push local)
+python plugin_api.py sync --profile default --mode sanitized
+
+# Hoặc qua Hermes tool
+sync_profile(profile_name="default", mode="sanitized")
+```
+
+### Bước 4: Restore từ repo (nếu làm mới máy hoặc muốn reset về state cũ)
+
+```bash
+# Restore latest từ repo
+python plugin_api.py restore --profile default
+
+# Restore từ commit cụ thể (branch, tag, hoặc commit SHA)
+python plugin_api.py restore --profile default --version v1.0.0
+```
+
+### Tool mới trong v1.1
+
+| Tool | Mô tả |
+|------|-------|
+| `setup_backup_repo` | Tạo private repo trên GitHub của user. Chỉ private — không bao giờ public. Lưu config local. |
+| `sync_profile` | Pull remote archive về → merge state.db/memories/sessions/skills → push local profile lên repo. |
+| `restore_profile` | Pull archive từ repo (có thể chọn branch/tag/commit) → import vào local profile. |
+| `auto_sync_on_load` | Chạy tự động khi Hermes load plugin. Check auth, detect repo, sync hoặc tạo repo mới. |
+
+### Flow chi tiết của `sync_profile`
+
+```
+1. Kiểm tra config → lấy repo_slug, profile_name
+2. Verify repo vẫn private (nếu public → REFUSE syncing, bảo lưu security)
+3. Pull remote archive mới nhất từ repo (tìm file *.zip trong repo)
+4. Nếu có remote archive:
+   a. Extract ra temp dir
+   b. So sánh state.db: nếu remote mới hơn → replace local (backup local trước)
+   c. Merge memories: copy remote memories chưa có local, nếu conflict → keep cả 2 (local backup dengan timestamp)
+   d. Merge sessions: copy remote sessions chưa có local
+   e. Merge skills: copy remote skills chưa có local
+5. Export local profile sang archive (sanitized hoặc full tùy mode)
+6. Push archive lên repo với commit message
+7. Trả về result: repo_url, commit_sha, merge_stats
+```
+
+### State merge strategy
+
+| Component | Chiến lược merge |
+|-----------|-----------------|
+| **state.db** (SQLite session store) | Nếu remote mới hơn local → replace local, backup local trước. Nếu local mới hơn → keep local. |
+| **memories/** | Copy remote files chưa có local. Nếu file cùng tên nhưng content khác → backup local với timestamp suffix, replace bằng remote. |
+| **sessions/** | Copy remote session files chưa có local. Không overwrite local sessions. |
+| **skills/** | Copy remote skills (files + dirs) chưa có local. Không overwrite local skills. |
+
+### Private enforcement
+
+Plugin tự động check visibility của repo trước mỗi sync:
+
+```python
+if repo_info.get("visibility") != "private":
+    return {
+        "success": False,
+        "message": f"SECURITY: Repo {owner}/{repo} is now PUBLIC. Convert back to private.",
+    }
+```
+
+Nếu user vô tình đổi repo thành public (hoặc ai đó invite user vào org làm public), plugin sẽ REFUSE sync và báo user convert về private ngay. Đảm bảo profile không để lộ ra public.
 
 ---
 

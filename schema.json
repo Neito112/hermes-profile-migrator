@@ -82,6 +82,103 @@
           "message": { "type": "string" }
         }
       }
+    },
+    "setup_backup_repo": {
+      "description": "Create a private GitHub repository for automated profile backup and sync. This repo will store your sanitized profile archives. ALWAYS PRIVATE — never public, to protect your agent config from exposure.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "repo_name": {
+            "type": "string",
+            "description": "Name for the backup repository. Defaults to 'hermes-profile-backup'.",
+            "default": "hermes-profile-backup"
+          },
+          "profile_name": {
+            "type": "string",
+            "description": "The Hermes profile this repo will back up. Defaults to 'default'.",
+            "default": "default"
+          },
+          "add_readme": {
+            "type": "boolean",
+            "description": "Whether to add a README.md to the new repository.",
+            "default": true
+          }
+        },
+        "required": []
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "repo_url": { "type": "string" },
+          "repo_name": { "type": "string" },
+          "profile_name": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      }
+    },
+    "sync_profile": {
+      "description": "Export the configured Hermes profile and push it to your private backup repository on GitHub. Creates a new commit with the profile archive. Requires setup_backup_repo to have been run first.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "profile_name": {
+            "type": "string",
+            "description": "Profile to sync. Defaults to the one configured in setup_backup_repo.",
+            "default": ""
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["sanitized", "full"],
+            "description": "Export mode. 'sanitized' (default) strips API keys; 'full' keeps everything.",
+            "default": "sanitized"
+          },
+          "message": {
+            "type": "string",
+            "description": "Commit message. Defaults to auto-generated 'Sync profile <name> at <timestamp>'.",
+            "default": ""
+          }
+        },
+        "required": []
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "repo_url": { "type": "string" },
+          "commit": { "type": "string" },
+          "profile_name": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      }
+    },
+    "restore_profile": {
+      "description": "Pull the latest profile archive from your private backup repository and import it into your local Hermes installation. Requires setup_backup_repo to have been run first.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "profile_name": {
+            "type": "string",
+            "description": "Profile to restore. Defaults to the one configured in setup_backup_repo.",
+            "default": ""
+          },
+          "version": {
+            "type": "string",
+            "description": "Git ref to restore from (branch name, tag, or commit SHA). Defaults to 'main' or 'master'.",
+            "default": ""
+          }
+        },
+        "required": []
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "profile_name": { "type": "string" },
+          "profile_path": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      }
     }
   }
 }
