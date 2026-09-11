@@ -12,6 +12,7 @@
     "tools": ["export_profile", "import_profile", "setup_backup_repo", "sync_profile", "restore_profile", "auto_sync_on_load"],
     "platforms": ["windows", "linux", "macos"]
   },
+  "installScript": "install.py",
   "dependencies": {
     "pyyaml": "^6.0",
     "python-dotenv": "^1.0"

@@ -435,10 +435,96 @@ SENSITIVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 ---
 
+## 🤖 Share with Other Agents / Chia sẻ cho agent khác
+
+Plugin này được thiết kế để **bất kỳ Hermes Agent nào cũng có thể tự cài và sử dụng** chỉ từ 1 link repo.
+
+### Cách agent khác cài plugin
+
+Một agent (hoặc human) chỉ cần biết **repo URL**:
+
+```
+https://github.com/Neito112/hermes-profile-migrator
+```
+
+### Cách 1 — Dùng install.py (khuyến nghị, 1 command)
+
+```bash
+python3 install.py --repo https://github.com/Neito112/hermes-profile-migrator
+```
+
+Script sẽ tự động:
+1. Clone repo vào `~/.hermes/plugins/hermes-profile-migrator`
+2. Kiểm tra file cần thiết (`plugin_api.py`, `package.json`)
+3. Lưu install record vào `~/.hermes/.installed_plugins.json`
+4. Tự reload Hermes plugins (nếu Hermes CLI có sẵn)
+
+### Cách 2 — CLI trực tiếp (không cần install.py)
+
+```bash
+cd ~/.hermes/plugins
+git clone --depth 1 https://github.com/Neito112/hermes-profile-migrator
+hermes plugins reload
+```
+
+### Cách 3 — Sau khi cài, cấu hình ban đầu
+
+```bash
+python3 ~/.hermes/plugins/hermes-profile-migrator/install.py --repo https://github.com/Neito112/hermes-profile-migrator --profile default
+python3 ~/.hermes/plugins/hermes-profile-migrator/plugin_api.py auto-check
+```
+
+### Agent self-install flow
+
+```
+Agent nhận task → check plugin chưa cài (kiểm tra ~/.hermes/plugins/hermes-profile-migrator)
+→ chạy install.py clone repo
+→ plugin tự động chạy auto_sync_on_load khi Hermes khởi động
+→ sync_profile pull remote + merge state + push local
+→ Done — Agent có profile, memories, sessions, skills trên máy này
+```
+
+### File dành riêng cho agent
+
+- `AGENT_GUIDE.md` — hướng dẫn chi tiết cho AI agent (cách cài, cách gọi tool, troubleshooting)
+- `install.py` — script cài standalone, agent nào cũng chạy được, không phụ thuộc Hermes
+- `package.json` — field `installScript` trỏ đến `install.py` để agent discover
+
+### Agent tự check plugin chưa cài
+
+```bash
+# Kiểm tra nhanh
+[ -d "${HERMES_HOME}/plugins/hermes-profile-migrator" ] && echo "INSTALLED" || echo "NOT INSTALLED"
+
+# Hoặc list tất cả plugin đã cài
+python3 "${HERMES_HOME}/plugins/hermes-profile-migrator/install.py" --list
+```
+
+### Gửi link cho agent khác
+
+Chỉ cần gửi **1 link** — agent sẽ tự biết cách xử lý:
+
+> "Cài plugin profile migrator từ https://github.com/Neito112/hermes-profile-migrator — chạy `python3 install.py --repo <URL>` trong thư mục Hermite"
+
+---
+
+## 🔍 Troubleshooting / Sửa lỗi
+
+| Vấn đề | Nguyên nhân | Giải pháp |
+|--------|------------|-----------|
+| `GitHub CLI not authenticated` | `gh auth status` failed | Chạy `gh auth login` hoặc kiểm tra token trong Hermes config |
+| `Cannot access repo` | Repo không tồn tại, hoặc token không có permission | Kiểm tra repo URL, kiểm tra token scope (`repo` permission cần thiết) |
+| `No backup repo configured` | Chưa chạy `setup_backup_repo` | Chạy `python3 plugin_api.py setup --profile <name>` |
+| `Archive not found in repo` | Repo trống, chưa có profile archive nào được push | Chạy `sync_profile` từ máy có dữ liệu trước |
+| `Plugin not registered` | Hermes chưa reload plugins | Chạy `hermes plugins reload` |
+| `Permission denied` khi git push | Token không có write permission cho repo | Kiểm tra token scope hoặc dùng SSH key |
+
+---
+
 ## LICENSE
 
 MIT License — xét theo `package.json`. Bạn được tự do sử dụng, sửa đổi, và phân phối cho cộng đồng Hermes.
 
 ---
 
-*Dominoes by the community, for the community.*
+*Plugin tự động hóa profile backup + sync. Bạn chỉ cần cài 1 lần — sau đó tự hoạt động.*
