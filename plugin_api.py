@@ -42,8 +42,66 @@ def _get_hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 
 
+def _get_profile_name_from_env() -> str | None:
+    """
+    Try to detect current profile name from environment.
+    Returns profile name if detected, None otherwise.
+    """
+    # Check if there's a profiles/ subdirectory — normal Hermes multi-profile setup
+    hermes_home = _get_hermes_home()
+    profiles_dir = hermes_home / "profiles"
+    if profiles_dir.is_dir():
+        # Could be any profile — we don't know which without explicit config
+        # Fall back to config.json or "default"
+        return None
+
+    # If no profiles/ subdir, the Hermes home itself IS the profile directory
+    # Profile name = last component of Hermes home path
+    home_name = hermes_home.name
+    if home_name and home_name != ".hermes":
+        return home_name
+
+    # Fallback: check parent dir name (for profiles/<name> structure)
+    parent = hermes_home.parent
+    if parent.name == "profiles" and hermes_home.name:
+        return hermes_home.name
+
+    return None
+
+
+def _get_current_profile_dir() -> Path:
+    """
+    Get the current profile directory, handling both:
+    - Multi-profile: ~/.hermes/profiles/<name>/
+    - Single-profile (this env): ~/.hermes/ itself is the profile dir
+    """
+    hermes_home = _get_hermes_home()
+    profiles_dir = hermes_home / "profiles"
+
+    if profiles_dir.is_dir():
+        # Multi-profile setup: find profile from config or use "default"
+        profile_name = _get_plugin_config().get("profile_name", "default")
+        return _profile_dir(profile_name)
+
+    # Single-profile setup: Hermes home IS the profile
+    return hermes_home
+
+
 def _profile_dir(profile_name: str) -> Path:
-    return _get_hermes_home() / "profiles" / profile_name
+    """Get profile directory for a given profile name."""
+    hermes_home = _get_hermes_home()
+    profiles_dir = hermes_home / "profiles"
+
+    if profiles_dir.is_dir():
+        # Multi-profile: standard layout
+        return profiles_dir / profile_name
+    else:
+        # Single-profile: profiles dir doesn't exist, Hermes home IS the profile
+        # Only return non-hermes-home path if profile_name is "default" or matches home name
+        if profile_name == "default" or profile_name == hermes_home.name:
+            return hermes_home
+        # Otherwise, try standard layout anyway (may not exist)
+        return profiles_dir / profile_name
 
 
 def _windows_username() -> str:
@@ -322,26 +380,70 @@ def _get_latest_archive_from_repo(owner: str, repo: str, ref: str = "main") -> P
 
 
 def _push_archive_to_repo(owner: str, repo: str, archive_path: Path, commit_msg: str, branch: str = "main") -> str:
+    """
+    Push an archive file to the backup repo using gh CLI (authenticated).
+    Handles both empty repos (first commit) and existing repos.
+    """
     import tempfile as _tempfile
 
+    # Clone using gh (authenticated) instead of raw git@ssh
     temp_dir = _tempfile.mkdtemp()
     repo_dir = Path(temp_dir) / "repo"
-    subprocess.run(
-        ["git", "clone", f"git@github.com:{owner}/{repo}.git", str(repo_dir)],
-        check=True, capture_output=True,
+
+    # Try gh repo clone first (uses gh auth, works with HTTPS)
+    clone_result = subprocess.run(
+        ["gh", "repo", "clone", f"{owner}/{repo}", str(repo_dir)],
+        capture_output=True, text=True,
     )
 
+    if clone_result.returncode != 0:
+        # Fallback: maybe repo is empty and gh clone fails — try git clone
+        subprocess.run(
+            ["git", "clone", f"https://github.com/{owner}/{repo}.git", str(repo_dir)],
+            check=True, capture_output=True,
+        )
+
+    # Ensure we're on the right branch
+    subprocess.run(["git", "checkout", "-b", branch], cwd=repo_dir, capture_output=True)
+
+    # Copy archive into repo root
     arc_name = archive_path.name
     dest_file = repo_dir / arc_name
     shutil.copy2(archive_path, dest_file)
 
+    # Git add + commit
     subprocess.run(["git", "add", arc_name], cwd=repo_dir, check=True, capture_output=True)
+
+    # Configure git user for commit (use gh auth info if available)
+    try:
+        user_info = _gh_api("/user")
+        email = user_info.get("email", "hermes@agent.local")
+        username = user_info.get("login", "hermes-agent")
+        subprocess.run(["git", "config", "user.email", email], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", username], cwd=repo_dir, check=True, capture_output=True)
+    except Exception:
+        subprocess.run(["git", "config", "user.email", "hermes@agent.local"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Hermes Agent"], cwd=repo_dir, check=True, capture_output=True)
+
     subprocess.run(
         ["git", "commit", "-m", commit_msg],
         cwd=repo_dir, check=True, capture_output=True,
     )
-    subprocess.run(["git", "push", "origin", branch], cwd=repo_dir, check=True, capture_output=True)
 
+    # Push using gh (authenticated HTTPS push)
+    push_result = subprocess.run(
+        ["git", "push", "origin", branch],
+        cwd=repo_dir, capture_output=True, text=True,
+    )
+
+    if push_result.returncode != 0:
+        # Maybe need to set upstream first
+        subprocess.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=repo_dir, check=True, capture_output=True,
+        )
+
+    # Get commit SHA
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repo_dir, capture_output=True, text=True, check=True,
