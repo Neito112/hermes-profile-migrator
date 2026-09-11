@@ -1113,6 +1113,46 @@ def auto_sync_on_load() -> Dict[str, Any]:
         }
 
 
+def __init_auto_sync():
+    """Auto-run sync khi Hermes load plugin — trigger self on import."""
+    import logging
+    import sys as _sys
+
+    logger = logging.getLogger(__name__)
+
+    # Guard: chỉ chạy 1 lần per process
+    if getattr(_sys, "_hermes_profile_migrator_auto_sync_done", False):
+        return
+
+    _sys._hermes_profile_migrator_auto_sync_done = True
+
+    logger.info("Profile migrator: auto-sync starting...")
+
+    try:
+        result = auto_sync_on_load()
+        if result.get("success"):
+            logger.info(f"Profile migrator auto-sync OK: {result.get('message', '')[:200]}")
+        else:
+            logger.warning(f"Profile migrator auto-sync issue: {result.get('message', '')[:200]}")
+    except Exception as e:
+        logger.error(f"Profile migrator auto-sync failed: {e}")
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Trigger auto-sync khi module được import (Hermes load plugin)
+# ---------------------------------------------------------------------------
+
+# Chạy tự động khi Hermes import plugin_api module
+# Guard bằng flag để tránh trigger nhiều lần
+if not getattr(sys, "_hermes_profile_migrator_auto_sync_done", False):
+    try:
+        __init_auto_sync()
+    except Exception:
+        pass  # Không break Hermes load process
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
