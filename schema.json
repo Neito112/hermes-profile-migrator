@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Hermes Profile Migrator Tools",
+  "description": "Tools for exporting and importing Hermes Agent profiles with sanitization support.",
+  "tools": {
+    "export_profile": {
+      "description": "Export a Hermes profile directory into a compressed archive. In 'sanitized' mode (default), sensitive API keys are stripped and replaced with placeholder examples. In 'full' mode, the entire profile is archived as-is for internal machine-to-machine transfer.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "profile_name": {
+            "type": "string",
+            "description": "Name of the profile to export. Defaults to the active/default profile.",
+            "default": "default"
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Destination path for the exported archive. Defaults to Desktop.",
+            "default": ""
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["sanitized", "full"],
+            "description": "'sanitized' strips API keys and secrets (safe for sharing). 'full' archives everything verbatim (for private migration only).",
+            "default": "sanitized"
+          },
+          "format": {
+            "type": "string",
+            "enum": ["zip", "tar.gz"],
+            "description": "Archive format.",
+            "default": "zip"
+          }
+        },
+        "required": []
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "archive_path": { "type": "string" },
+          "mode": { "type": "string" },
+          "files_sanitized": { "type": "integer", "description": "Number of sensitive values redacted (sanitized mode only)." },
+          "message": { "type": "string" }
+        }
+      }
+    },
+    "import_profile": {
+      "description": "Import a previously exported Hermes profile archive into the current machine. Automatically detects the Windows username and updates all stored paths in config files to match the new environment.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "archive_path": {
+            "type": "string",
+            "description": "Path to the exported profile archive (.zip or .tar.gz).",
+            "default": ""
+          },
+          "target_profile": {
+            "type": "string",
+            "description": "Name for the imported profile. Defaults to the archive's original profile name.",
+            "default": ""
+          },
+          "overwrite": {
+            "type": "boolean",
+            "description": "If true, overwrite an existing profile with the same name. If false, abort when a conflict is detected.",
+            "default": false
+          },
+          "preserve_relative_paths": {
+            "type": "boolean",
+            "description": "If true, only absolute paths under the old home directory are remapped. Relative paths and paths outside the home are left untouched.",
+            "default": true
+          }
+        },
+        "required": ["archive_path"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "profile_name": { "type": "string" },
+          "profile_path": { "type": "string" },
+          "paths_updated": { "type": "integer", "description": "Number of path references rewritten." },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  }
+}
